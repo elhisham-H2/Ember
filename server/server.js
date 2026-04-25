@@ -1,0 +1,292 @@
+const WebSocket = require('ws');
+const ElevenLabs = require('elevenlabs-node');
+
+const { cloudVisionAnalyze, lookupProtocol, gemmaOfflineAnalysis } = require('./ai');
+const { createThread, addMessage, getThreadSummary } = require('./backboard');
+
+const PORT = Number(process.env.WS_PORT || 8089);
+const wss = new WebSocket.Server({ port: PORT });
+const ELEVENLABS_API_KEY =
+  process.env.ELEVENLABS_API_KEY || process.env.EXPO_PUBLIC_ELEVENLABS_API_KEY;
+
+console.log(`WebSocket server listening on ws://localhost:${PORT}`);
+
+const towers = new Map(); // towerId -> { name, ws, missionActive }
+const chatHistory = []; // all chat messages since mission start
+const joinRequests = new Map(); // requestId -> { fromResponderWs, towerId, responderEmail }
+const missionTeams = new Map(); // towerId -> Set<responderEmail>
+const activeRecommendations = new Map(); // recId -> { analysis, protocol }
+const threadByTower = new Map(); // towerId -> threadId
+
+const elevenLabs = new ElevenLabs({
+  apiKey: ELEVENLABS_API_KEY,
+});
+
+function sendTo(ws, data) {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
+  }
+}
+
+function broadcast(data) {
+  wss.clients.forEach((client) => {
+    sendTo(client, data);
+  });
+}
+
+async function generateVoiceAlert(text) {
+  if (!ELEVENLABS_API_KEY) {
+    throw new Error('Missing ElevenLabs API key');
+  }
+
+  const voiceId = '21m00Tcm4TlvDq8ikWAM';
+  const response = await elevenLabs.textToSpeech({
+    text,
+    voice_id: voiceId,
+    model_id: 'eleven_multilingual_v2',
+    voice_settings: {
+      stability: 0.5,
+      similarity_boost: 0.8,
+    },
+  });
+
+  const audioBase64 = Buffer.from(response).toString('base64');
+  return `data:audio/mpeg;base64,${audioBase64}`;
+}
+
+wss.on('connection', (ws) => {
+  console.log('Client connected');
+
+  ws.on('message', async (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+
+    console.log('Received:', msg.type, 'from', msg.sender || msg.towerId);
+
+    switch (msg.type) {
+      case 'chat_message':
+        chatHistory.push(msg);
+        broadcast(msg);
+        break;
+
+      case 'hazard_report': {
+        chatHistory.push(msg);
+        broadcast(msg);
+
+        let summary = '';
+        let protocol = '';
+
+        try {
+          const { text, objects } = await cloudVisionAnalyze(msg.imageBase64);
+          summary = `Detected: ${text || objects.join(', ') || 'Unknown hazard'}`;
+          protocol = lookupProtocol(objects, text);
+        } catch (err) {
+          console.log('Cloud Vision unavailable, switching to offline fallback');
+          protocol = await gemmaOfflineAnalysis('', ['unknown']);
+          summary = 'Offline analysis: unknown hazard';
+        }
+
+        const recommendation = {
+          type: 'ai_recommendation',
+          id: msg.id,
+          analysis: summary,
+          protocol,
+          status: 'pending',
+          timestamp: Date.now(),
+        };
+        activeRecommendations.set(recommendation.id, {
+          analysis: recommendation.analysis,
+          protocol: recommendation.protocol,
+        });
+        chatHistory.push(recommendation);
+        broadcast(recommendation);
+
+        const threadId = threadByTower.get(msg.towerId);
+        if (threadId) {
+          try {
+            await addMessage(threadId, { type: 'hazard_report', ...msg, summary, protocol });
+            await addMessage(threadId, recommendation);
+          } catch (err) {
+            console.error('Backboard log error:', err.message);
+          }
+        }
+        break;
+      }
+
+      case 'recommendation_action': {
+        if (msg.action === 'approve') {
+          const approvedRec = activeRecommendations.get(msg.recommendationId);
+          if (approvedRec) {
+            try {
+              const audioUrl = await generateVoiceAlert(approvedRec.protocol);
+              broadcast({
+                type: 'voice_alert',
+                text: approvedRec.protocol,
+                audioUrl,
+                target: 'responders',
+              });
+            } catch (err) {
+              console.error('ElevenLabs error:', err.message);
+              broadcast({
+                type: 'voice_alert',
+                text: approvedRec.protocol,
+                target: 'responders',
+              });
+            }
+
+            const towerThreadId = threadByTower.get(msg.towerId);
+            if (towerThreadId) {
+              try {
+                await addMessage(towerThreadId, {
+                  type: 'protocol_approved',
+                  recommendationId: msg.recommendationId,
+                  protocol: approvedRec.protocol,
+                });
+              } catch (err) {
+                console.error('Backboard log error:', err.message);
+              }
+            }
+          }
+        }
+
+        const statusEvent = {
+          type: msg.action === 'approve' ? 'recommendation_approved' : 'recommendation_denied',
+          id: msg.recommendationId,
+        };
+        chatHistory.push(statusEvent);
+        broadcast(statusEvent);
+        break;
+      }
+
+      case 'mission_start': {
+        const existing = towers.get(msg.towerId) || { name: msg.towerName, ws };
+        towers.set(msg.towerId, {
+          ...existing,
+          name: msg.towerName,
+          ws,
+          missionActive: true,
+        });
+        if (!missionTeams.has(msg.towerId)) {
+          missionTeams.set(msg.towerId, new Set());
+        }
+        broadcast(msg);
+        broadcast({
+          type: 'team_update',
+          towerId: msg.towerId,
+          teamEmails: Array.from(missionTeams.get(msg.towerId) ?? []),
+        });
+        break;
+      }
+
+      case 'tower_register': {
+        towers.set(msg.towerId, {
+          name: msg.towerName,
+          ws,
+          missionActive: msg.missionActive ?? true,
+        });
+
+        if (!threadByTower.has(msg.towerId)) {
+          try {
+            const threadId = await createThread();
+            if (threadId) threadByTower.set(msg.towerId, threadId);
+          } catch (err) {
+            console.error('Backboard thread create failed:', err.message);
+          }
+        }
+        break;
+      }
+
+      case 'get_towers': {
+        const towerList = Array.from(towers.entries()).map(([id, info]) => ({
+          id,
+          name: info.name,
+          missionActive: info.missionActive,
+        }));
+        sendTo(ws, { type: 'tower_list', towers: towerList });
+        break;
+      }
+
+      case 'join_request': {
+        const tower = towers.get(msg.towerId);
+        if (!tower || !tower.missionActive) {
+          sendTo(ws, { type: 'join_denied', reason: 'Tower not available' });
+          return;
+        }
+        const requestId = `${Date.now()}-${Math.random()}`;
+        joinRequests.set(requestId, {
+          fromResponderWs: ws,
+          towerId: msg.towerId,
+          responderEmail: msg.responderEmail,
+        });
+        sendTo(tower.ws, {
+          type: 'join_request_alert',
+          requestId,
+          responderEmail: msg.responderEmail,
+        });
+        break;
+      }
+
+      case 'join_response': {
+        const request = joinRequests.get(msg.requestId);
+        if (!request) return;
+
+        if (msg.accept) {
+          if (!missionTeams.has(request.towerId)) {
+            missionTeams.set(request.towerId, new Set());
+          }
+          missionTeams.get(request.towerId).add(request.responderEmail);
+          const teamEmails = Array.from(missionTeams.get(request.towerId));
+
+          const threadId = threadByTower.get(request.towerId);
+          let summary = '';
+          if (threadId) {
+            try {
+              const summaryData = await getThreadSummary(threadId);
+              summary = summaryData?.summary || '';
+            } catch (err) {
+              console.error('Backboard summary error:', err.message);
+            }
+          }
+
+          sendTo(request.fromResponderWs, {
+            type: 'mission_joined',
+            towerId: request.towerId,
+            towerName: towers.get(request.towerId)?.name,
+            messages: chatHistory,
+            teamEmails,
+            backboardSummary: summary,
+          });
+
+          broadcast({
+            type: 'team_update',
+            towerId: request.towerId,
+            teamEmails,
+          });
+        } else {
+          sendTo(request.fromResponderWs, { type: 'join_denied' });
+        }
+        joinRequests.delete(msg.requestId);
+        break;
+      }
+
+      default:
+        sendTo(ws, msg);
+    }
+  });
+
+  ws.on('close', () => {
+    for (const [id, info] of towers.entries()) {
+      if (info.ws === ws) {
+        towers.delete(id);
+        missionTeams.delete(id);
+        threadByTower.delete(id);
+        console.log('Tower disconnected:', id);
+        break;
+      }
+    }
+  });
+});
